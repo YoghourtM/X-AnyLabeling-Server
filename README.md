@@ -19,6 +19,19 @@
 
 <img alt="X-AnyLabeling-Server Logo" src="assets/logo/X-AnyLabeling-Server.png" style="width:100%;display:block;" />
 
+## About this fork
+
+This fork of [CVHub520/X-AnyLabeling-Server](https://github.com/CVHub520/X-AnyLabeling-Server) adds a local **Segment Anything 3.1** service for the [X-AnyLabeling fork](https://github.com/YoghourtM/X-AnyLabeling/tree/feat/vlm-annotation): text prompts, clicks / a box, and example boxes from one `sam3.1_multiplex.pt` checkpoint in about 5.5 GB of GPU memory, run in docker on `127.0.0.1:8000`.
+
+```bash
+export SAM31_CHECKPOINT=/path/to/sam3.1_multiplex.pt
+scripts/sam31_server.sh build && scripts/sam31_server.sh start
+```
+
+Details: [docker/sam31/README.md](./docker/sam31/README.md). Client-side usage: [English](https://github.com/YoghourtM/X-AnyLabeling/blob/feat/vlm-annotation/docs/en/vlm_annotator.md) | [中文](https://github.com/YoghourtM/X-AnyLabeling/blob/feat/vlm-annotation/docs/zh_cn/vlm_annotator.md). The rest of this README is upstream's.
+
+本仓库 fork 自 CVHub520/X-AnyLabeling-Server，新增本地 SAM 3.1 服务（文本提示、点击或框选、示例框找相似），中文使用说明见上方链接。
+
 ## About
 
 X-AnyLabeling-Server is a simple, lightweight and extensible serving framework for AI model inference, specifically designed for [X-AnyLabeling](https://github.com/CVHub520/X-AnyLabeling). It provides a production-ready solution with pluggable architecture and flexible configuration for various auto-labeling scenarios. Its core features include:
