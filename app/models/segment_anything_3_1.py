@@ -2,7 +2,8 @@
 
 One ``sam3.1_multiplex.pt`` checkpoint serves three tasks:
 
-- ``text``: segment every instance of the prompted concepts (image detector).
+- ``text``: segment every instance of the prompted concepts (image detector);
+  ``label: prompt, prompt`` names the results and merges several prompts.
 - ``exemplar``: positive / negative example boxes find similar objects.
 - ``interactive``: clicks or one box segment a single object with the SAM 3.1
   multiplex tracker, built lazily on first use.
@@ -13,6 +14,7 @@ so this model imports the installed upstream package instead.
 
 import hashlib
 import os
+import re
 import sys
 import threading
 import time
@@ -24,7 +26,7 @@ import numpy as np
 from loguru import logger
 from PIL import Image
 
-from . import BaseModel, parse_prompts
+from . import BaseModel
 from app.core.registry import register_model
 from app.schemas.shape import Shape
 
@@ -163,6 +165,91 @@ def image_key(image: np.ndarray) -> str:
     return digest.hexdigest()
 
 
+_ENTRY_SEPARATORS = re.compile(r"[;；\n]+")
+_LABEL_SEPARATOR = re.compile(r"[:：]")
+# "." is kept from the upstream SAM prompt syntax ("person. car").
+_PROMPT_SEPARATORS = re.compile(r"[,，.]+")
+
+
+def parse_label_prompts(text: str) -> List[Tuple[str, List[str]]]:
+    """Parse ``label: prompt, prompt; other`` into ``(label, prompts)``.
+
+    Entries are separated by ``;`` / ``；`` or newlines. In ``label: a, b``
+    the prompts ``a`` and ``b`` are sent to SAM and their results named
+    ``label``; a bare ``a, b`` uses each prompt as its own label. Entries
+    with the same label are merged.
+    """
+    merged: "OrderedDict[str, List[str]]" = OrderedDict()
+
+    def split(part: str) -> List[str]:
+        return [p.strip() for p in _PROMPT_SEPARATORS.split(part) if p.strip()]
+
+    for entry in _ENTRY_SEPARATORS.split(text or ""):
+        if _LABEL_SEPARATOR.search(entry):
+            label, rest = _LABEL_SEPARATOR.split(entry, maxsplit=1)
+            label, prompts = label.strip(), split(rest)
+            if label:
+                pairs = [(label, prompts or [label])]
+            else:
+                pairs = [(prompt, [prompt]) for prompt in prompts]
+        else:
+            pairs = [(prompt, [prompt]) for prompt in split(entry)]
+        for label, prompts in pairs:
+            bucket = merged.setdefault(label, [])
+            bucket += [p for p in prompts if p not in bucket]
+    return list(merged.items())
+
+
+def _numpy(value) -> np.ndarray:
+    if hasattr(value, "cpu"):
+        return value.float().cpu().numpy()
+    return np.asarray(value)
+
+
+def _mask_bounds(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(0))
+    if not len(rows):
+        return None
+    return rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+
+
+def merge_prompt_results(results, iou_threshold: float):
+    """Keep the best of results from different prompts that overlap.
+
+    ``results`` holds ``(mask, box, score, prompt_index)``. A result whose
+    mask IoU with a higher-scoring result of another prompt reaches
+    ``iou_threshold`` is dropped; results of the same prompt are left alone
+    (SAM has de-duplicated those). Returns ``(mask, box, score)`` by score.
+    """
+    kept, merged = [], []
+    for mask, box, score, source in sorted(results, key=lambda r: -r[2]):
+        binary = np.asarray(mask).squeeze() > 0.5
+        bounds = _mask_bounds(binary)
+        if bounds is None:
+            continue
+        area = int(binary.sum())
+        duplicate = False
+        for other, other_bounds, other_area, other_source in kept:
+            if other_source == source:
+                continue
+            y1 = max(bounds[0], other_bounds[0])
+            y2 = min(bounds[1], other_bounds[1])
+            x1 = max(bounds[2], other_bounds[2])
+            x2 = min(bounds[3], other_bounds[3])
+            if y1 >= y2 or x1 >= x2:
+                continue
+            inter = int(
+                np.logical_and(binary[y1:y2, x1:x2], other[y1:y2, x1:x2]).sum()
+            )
+            if inter / (area + other_area - inter) >= iou_threshold:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append((binary, bounds, area, source))
+            merged.append((binary, box, score))
+    return merged
+
+
 def _task_widgets(*names: str) -> Dict[str, Dict[str, Any]]:
     return {name: {} for name in names}
 
@@ -172,7 +259,8 @@ TASKS = [
         "id": TASK_TEXT,
         "name": "Text prompt",
         "description": "Segment every instance of the given concepts, "
-        "e.g. 'person, car'",
+        "e.g. 'person, car'. 'label: prompt, prompt; ...' names the "
+        "results and merges several prompts into one label",
         "batch_processing_mode": "text_prompt",
         "active_widgets": {
             **_task_widgets(
@@ -184,7 +272,10 @@ TASKS = [
                 "mask_fineness_value_label",
                 "toggle_preserve_existing_annotations",
             ),
-            "edit_text": {"placeholder": "person, car, traffic light"},
+            "edit_text": {
+                "placeholder": "person, car; "
+                "tactile_paving: tactile paving, guide tiles"
+            },
         },
     },
     {
@@ -349,11 +440,7 @@ class SegmentAnything31(BaseModel):
         show_boxes: bool,
     ) -> List[Shape]:
         shapes = []
-        masks = masks.float().cpu().numpy() if hasattr(masks, "cpu") else masks
-        boxes = boxes.float().cpu().numpy() if hasattr(boxes, "cpu") else boxes
-        scores = (
-            scores.float().cpu().numpy() if hasattr(scores, "cpu") else scores
-        )
+        masks, boxes, scores = _numpy(masks), _numpy(boxes), _numpy(scores)
         for index, label in enumerate(labels):
             score = float(min(max(scores[index], 0.0), 1.0))
             polygon = mask_to_polygon(masks[index], epsilon)
@@ -401,33 +488,44 @@ class SegmentAnything31(BaseModel):
                 return self._predict_text(image, params)
 
     def _predict_text(self, image, params):
-        prompts = parse_prompts(
-            params.get("text_prompt", ""), separators=[",", ".", ";", "\n"]
-        )
-        if not prompts:
+        labelled = parse_label_prompts(params.get("text_prompt", ""))
+        if not labelled:
             return {"shapes": [], "description": ""}
         conf, epsilon, show_boxes = self._settings(params)
+        merge_iou = float(self.params.get("merge_iou", 0.5))
         shapes = []
         with self._autocast():
             state = self._image_inference_state(image)
             self.processor.set_confidence_threshold(conf)
-            for prompt in prompts:
-                self.processor.reset_all_prompts(state)
-                out = self.processor.set_text_prompt(
-                    prompt=prompt, state=state
-                )
-                count = len(out["scores"])
-                if count:
+            for label, prompts in labelled:
+                results = []
+                for source, prompt in enumerate(prompts):
+                    self.processor.reset_all_prompts(state)
+                    out = self.processor.set_text_prompt(
+                        prompt=prompt, state=state
+                    )
+                    if not len(out["scores"]):
+                        continue
+                    masks, boxes = _numpy(out["masks"]), _numpy(out["boxes"])
+                    scores = _numpy(out["scores"])
+                    results += [
+                        (masks[i], boxes[i], float(scores[i]), source)
+                        for i in range(len(scores))
+                    ]
+                if len(prompts) > 1:
+                    results = merge_prompt_results(results, merge_iou)
+                if results:
+                    masks, boxes, scores = zip(*[r[:3] for r in results])
                     shapes += self._shapes(
-                        out["masks"],
-                        out["boxes"],
-                        out["scores"],
-                        [prompt] * count,
+                        masks,
+                        boxes,
+                        scores,
+                        [label] * len(results),
                         epsilon,
                         show_boxes,
                     )
             self.processor.reset_all_prompts(state)
-        logger.info(f"SAM 3.1 text {prompts}: {len(shapes)} shapes")
+        logger.info(f"SAM 3.1 text {labelled}: {len(shapes)} shapes")
         return {"shapes": shapes, "description": ""}
 
     def _predict_exemplar(self, image, marks, params):

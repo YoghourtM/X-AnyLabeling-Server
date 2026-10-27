@@ -9,6 +9,13 @@ protocol. All three tasks share one `sam3.1_multiplex.pt` checkpoint:
 | Click / box (single object) | Positive / negative clicks, or one box | One polygon |
 | Example boxes (find similar) | Positive / negative example boxes | Polygons for similar objects |
 
+Text prompts may name their results: in
+`tactile_paving: tactile paving, guide tiles; person` the two prompts after
+the colon are both labelled `tactile_paving`, and when they find the same
+object (mask IoU ≥ `merge_iou`, default 0.5) only the higher-scoring result
+is kept. Entries are separated by `;` / `；` or new lines, prompts by `,` /
+`，`; an entry without a colon uses each prompt as its label.
+
 By default (`detector: shared`) one SAM 3.1 multiplex model serves every
 task in about 5.5 GB of GPU memory: its detector handles text prompts and
 example boxes, its tracker handles clicks. `detector: image_model` instead

@@ -15,6 +15,7 @@ from app.models.segment_anything_3_1 import (
     interactive_prompt,
     load_detector_weights,
     mask_to_polygon,
+    parse_label_prompts,
     split_marks,
 )
 
@@ -88,6 +89,30 @@ class TestHelpers(unittest.TestCase):
         )
         self.assertEqual(points, [[0.5, 0.5], [0.1, 0.2], [0.9, 0.8]])
         self.assertEqual(labels, [0, 2, 3])
+
+    def test_parse_label_prompts(self):
+        self.assertEqual(
+            parse_label_prompts(
+                "person, car；tactile_paving： tactile paving，guide tiles\n"
+                "car. bus"
+            ),
+            [
+                ("person", ["person"]),
+                ("car", ["car"]),
+                ("tactile_paving", ["tactile paving", "guide tiles"]),
+                ("bus", ["bus"]),
+            ],
+        )
+        self.assertEqual(
+            parse_label_prompts("x: a; sign:; : b, c; x: b, a"),
+            [
+                ("x", ["a", "b"]),
+                ("sign", ["sign"]),
+                ("b", ["b"]),
+                ("c", ["c"]),
+            ],
+        )
+        self.assertEqual(parse_label_prompts(" ; "), [])
 
     def test_mask_to_polygon_is_closed(self):
         polygon = mask_to_polygon(_square_mask(), 0.001)
@@ -189,6 +214,45 @@ class TestPredict(unittest.TestCase):
         model.processor.set_text_prompt.return_value = {"scores": []}
         model.predict(self.image, {"current_task": "text", "text_prompt": "x"})
         self.assertEqual(model.processor.set_image.call_count, 1)
+
+    def test_label_prompts_merge_repeats_across_prompts(self):
+        def mask(rows, cols):
+            m = np.zeros((1, 40, 60), dtype=bool)
+            m[0, rows, cols] = True
+            return m
+
+        def out(*items):
+            return {
+                "masks": np.stack([m for m, _ in items]),
+                "boxes": np.zeros((len(items), 4)),
+                "scores": np.array([s for _, s in items]),
+            }
+
+        model = _model()
+        model.processor.set_image.return_value = {}
+        model.processor.set_text_prompt.side_effect = [
+            out(
+                (mask(slice(10, 30), slice(20, 50)), 0.6),
+                (mask(slice(0, 8), slice(0, 10)), 0.9),
+            ),
+            # IoU 0.93 with the first mask of "a": the better one is kept.
+            out((mask(slice(10, 30), slice(22, 50)), 0.8)),
+            # IoU 0.25 with a kept mask: a separate object.
+            out((mask(slice(0, 8), slice(6, 16)), 0.7)),
+        ]
+        result = model.predict(
+            self.image,
+            {"current_task": "text", "text_prompt": "paving: a, b, c"},
+        )
+        prompts = [
+            c.kwargs["prompt"]
+            for c in model.processor.set_text_prompt.call_args_list
+        ]
+        self.assertEqual(prompts, ["a", "b", "c"])
+        self.assertEqual([s.label for s in result["shapes"]], ["paving"] * 3)
+        self.assertEqual(
+            [round(s.score, 2) for s in result["shapes"]], [0.9, 0.8, 0.7]
+        )
 
     def test_exemplar_boxes_are_normalized_cxcywh(self):
         model = _model()

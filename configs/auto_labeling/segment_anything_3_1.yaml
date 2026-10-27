@@ -13,6 +13,9 @@ params:
   #   ~0.1 higher, but it needs ~4 GB more once clicks are used.
   detector: shared
   conf_threshold: 0.5
+  # Text prompts "label: a, b": a result of one prompt is dropped when its
+  # mask IoU with a higher-scoring result of another prompt reaches this.
+  merge_iou: 0.5
   epsilon_factor: 0.001
   show_boxes: false
   # Click / box segmentation with the SAM 3.1 tracker. With
