@@ -1,0 +1,3 @@
+# Models for the local SAM 3.1 container (scripts/sam31_server.sh).
+enabled_models:
+  - segment_anything_3_1
